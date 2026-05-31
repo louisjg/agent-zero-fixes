@@ -2,7 +2,7 @@ import asyncio, random, string, threading
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Coroutine, Dict, Literal
 from enum import Enum
 import models
@@ -86,11 +86,11 @@ class AgentContext:
         self.paused = paused
         self.streaming_agent = streaming_agent
         self.task: DeferredTask | None = None
-        self.created_at = created_at or Localization.get().now()
+        self.created_at = created_at or datetime.now(timezone.utc)
         self.type = type
         AgentContext._counter += 1
         self.no = AgentContext._counter
-        self.last_message = last_message or Localization.get().now()
+        self.last_message = last_message or datetime.now(timezone.utc)
 
         # initialize agent at last (context is complete now)
         self.agent0 = agent0 or Agent(0, self.config, self)
@@ -335,6 +335,7 @@ class LoopData:
         self.params_temporary: dict = {}
         self.params_persistent: dict = {}
         self.current_tool = None
+        self.usage: dict | None = None  # token usage from last LLM call
 
         # override values with kwargs
         for key, value in kwargs.items():
@@ -584,7 +585,7 @@ class Agent:
             Agent.DATA_NAME_CTX_WINDOW,
             {
                 "text": full_text,
-                "tokens": tokens.approximate_prompt_tokens(full_text),
+                "tokens": tokens.approximate_tokens(full_text),
             },
         )
 
@@ -666,7 +667,7 @@ class Agent:
     def hist_add_message(
         self, ai: bool, content: history.MessageContent, tokens: int = 0, id: str = ""
     ):
-        self.last_message = Localization.get().now()
+        self.last_message = datetime.now(timezone.utc)
         # Allow extensions to process content before adding to history
         content_data = {"content": content}
         extension.call_extensions_sync(
@@ -780,8 +781,11 @@ class Agent:
             ),
         )
 
+        # Capture token usage from the utility model
+        usage = getattr(call_data["model"], "last_usage", None)
+
         await extension.call_extensions_async(
-            "util_model_call_after", self, call_data=call_data, response=response
+            "util_model_call_after", self, call_data=call_data, response=response, usage=usage
         )
 
         return response
@@ -824,8 +828,13 @@ class Agent:
             explicit_caching=call_data["explicit_caching"],
         )
 
+        # Capture token usage from the model and store on loop_data
+        usage = getattr(call_data["model"], "last_usage", None)
+        if self.loop_data:
+            self.loop_data.usage = usage
+
         await extension.call_extensions_async(
-            "chat_model_call_after", self, call_data=call_data, response=response, reasoning=reasoning
+            "chat_model_call_after", self, call_data=call_data, response=response, reasoning=reasoning, usage=usage
         )
 
         return response, reasoning
@@ -884,6 +893,10 @@ class Agent:
         if tool_request is not None:
             tool_name = raw_tool_name  # Initialize tool_name with raw_tool_name
             tool_method = None  # Initialize tool_method
+
+            # Split raw_tool_name into tool_name and tool_method if applicable
+            if ":" in raw_tool_name:
+                tool_name, tool_method = raw_tool_name.split(":", 1)
 
             tool = None  # Initialize tool to None
 

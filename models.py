@@ -291,6 +291,51 @@ def apply_rate_limiter_sync(
     )
 
 
+
+
+def _extract_usage(chunk) -> dict | None:
+    """
+    Extract usage metadata from a LiteLLM chunk or completion object.
+    Uses getattr with defaults throughout to avoid AttributeError on
+    Pydantic streaming models that raise on missing attributes.
+    Returns a normalized dict or None if no usage data is present.
+    """
+    # Use getattr to safely access usage - Pydantic models raise
+    # AttributeError on missing fields rather than returning None
+    usage = getattr(chunk, "usage", None)
+
+    if usage is None:
+        return None
+
+    result = {
+        "prompt_tokens":     getattr(usage, "prompt_tokens", None),
+        "completion_tokens": getattr(usage, "completion_tokens", None),
+        "total_tokens":      getattr(usage, "total_tokens", None),
+    }
+
+    # Only return if we actually got some token data
+    if not any(result.values()):
+        return None
+
+    for detail_key in ("prompt_tokens_details", "completion_tokens_details"):
+        detail = getattr(usage, detail_key, None)
+        if detail is not None:
+            result[detail_key] = (
+                vars(detail) if hasattr(detail, "__dict__") else dict(detail)
+            )
+
+    # Pass through raw hidden params for plugin-side provider decoding
+    hidden = getattr(chunk, "_hidden_params", None)
+    if hidden:
+        result["_hidden_params"] = hidden
+
+    # Capture the generation/request ID (used by OpenRouter Generation API)
+    chunk_id = getattr(chunk, "id", None)
+    if chunk_id:
+        result["_generation_id"] = chunk_id
+
+    return result
+
 class LiteLLMChatWrapper(SimpleChatModel):
     model_name: str
     provider: str
@@ -313,6 +358,7 @@ class LiteLLMChatWrapper(SimpleChatModel):
         super().__init__(model_name=model_value, provider=provider, kwargs=kwargs)  # type: ignore
         # Set A0 model config as instance attribute after parent init
         self.a0_model_conf = model_config
+        self.last_usage: dict | None = None  # populated after each call
 
     @property
     def _llm_type(self) -> str:
@@ -512,8 +558,13 @@ class LiteLLMChatWrapper(SimpleChatModel):
         retry_delay_s: float = float(call_kwargs.pop("a0_retry_delay_seconds", 1.5))
         stream = reasoning_callback is not None or response_callback is not None or tokens_callback is not None
 
+        # Ensure usage data is included in the final streaming chunk
+        if stream:
+            call_kwargs.setdefault("stream_options", {"include_usage": True})
+
         # results
         result = ChatGenerationResult()
+        usage_found = False
 
         attempt = 0
         while True:
@@ -567,6 +618,25 @@ class LiteLLMChatWrapper(SimpleChatModel):
                                 result.response = stop_response
                                 break
                     finally:
+                        # Drain remaining chunks BEFORE closing the stream to
+                        # capture the usage metadata chunk that arrives after
+                        # the last content chunk (early-stop optimization).
+                        if not usage_found:
+                            try:
+                                import asyncio
+                                drain_count = 0
+                                async with asyncio.timeout(3.0):
+                                    async for drain_chunk in _completion:  # type: ignore
+                                        drain_count += 1
+                                        if drain_count > 10:
+                                            break
+                                        usage = _extract_usage(drain_chunk)
+                                        if usage:
+                                            self.last_usage = usage
+                                            usage_found = True
+                                            break
+                            except Exception:
+                                pass  # Best-effort drain; never block
                         if stop_response is not None and hasattr(_completion, "aclose"):
                             await _completion.aclose()  # type: ignore[attr-defined]
 
